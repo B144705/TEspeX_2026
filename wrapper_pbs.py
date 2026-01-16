@@ -35,6 +35,7 @@ try:
   import math
   import pysam
   import pandas
+  from distutils.version import LooseVersion
   from functools import reduce
   import csv
 except ModuleNotFoundError:
@@ -88,16 +89,24 @@ def checkSampleFile(sfile,paired):
             sys.exit(1)
 # Check pysam and pandas version
 def checkPy():
+  min_python = (3, 10)
+  min_pandas = "2.2.2"
+  min_pysam = "0.22.0"
   pandas_ver = pandas.__version__
   pysam_ver = pysam.__version__
-  if pandas_ver != "0.23.0":
-    print("ERROR: 0.23.0 pandas version is required, %s detected" % str(pandas_ver))
-    print("Please, install the correct version of pandas (pip3 install --user pandas==0.23.0) and re-run TEspeX")
+  if sys.version_info < min_python:
+    print("ERROR: Python %s.%s or newer is required, %s detected" % (min_python[0], min_python[1], sys.version.split()[0]))
+    print("Please, install a newer Python version and re-run TEspeX")
     print("Exiting....")
     sys.exit(1)
-  if pysam_ver != "0.15.0" and pysam_ver != "0.15.1":
-    print("ERROR: 0.15.0 or 0.15.1 pysam version is required, %s detected" % str(pysam_ver))
-    print("Please, install the correct version of pysam and re-run TEspeX")
+  if LooseVersion(pandas_ver) < LooseVersion(min_pandas):
+    print("ERROR: pandas %s or newer is required, %s detected" % (min_pandas, str(pandas_ver)))
+    print("Please, install the correct version of pandas (pip3 install --user pandas==%s) and re-run TEspeX" % min_pandas)
+    print("Exiting....")
+    sys.exit(1)
+  if LooseVersion(pysam_ver) < LooseVersion(min_pysam):
+    print("ERROR: pysam %s or newer is required, %s detected" % (min_pysam, str(pysam_ver)))
+    print("Please, install the correct version of pysam (pip3 install --user pysam==%s) and re-run TEspeX" % min_pysam)
     print("Exiting....")
     sys.exit(1)
 # Check walltime format
