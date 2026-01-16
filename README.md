@@ -157,7 +157,7 @@ Copyright (C) 2016 Genome Research Ltd.
 
 To create the conda environment and install the required libraries type:
 ```
-conda create -n TEspeX_deps --override-channels -c bioconda -c defaults python=3.6 pandas=0.23.0 pysam'>=0.15.0,<=0.15.1'
+conda create -n TEspeX_deps --override-channels -c bioconda -c defaults python=3.11 pandas=2.2.2 pysam=0.22.0
 ## --> you will be asked to let conda download and install new packages: type Y
 
 # activate the environment - to be done every time TEspeX is used
@@ -170,9 +170,9 @@ which python3
 which pip3
 ## --> /path/to/envs/TEspeX_deps/bin/pip3
 python3 --version
-## --> Python 3.6.13 :: Anaconda, Inc.
+## --> Python 3.11.x :: Anaconda, Inc.
 pip3 --version
-## --> pip 21.1.3 from /path/to/envs/TEspeX_deps/lib/python3.6/site-packages/pip (python 3.6)
+## --> pip 23.x from /path/to/envs/TEspeX_deps/lib/python3.11/site-packages/pip (python 3.11)
 
 # deactivate the environment
 conda deactivate
@@ -441,5 +441,3 @@ If you found TEspeX usefull for your research, please cite:
 
 Ansaloni *et al.*, Bioinformatics, 2022: https://doi.org/10.1093/bioinformatics/btac526<br />
 Ansaloni *et al.*, BMC Bioinformatics, 2019: https://doi.org/10.1186/s12859-019-3088-7
-
-
