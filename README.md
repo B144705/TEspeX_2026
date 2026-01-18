@@ -244,8 +244,8 @@ This command shows the help that should be something very similar to:
 ```
 usage: TEspeX.py [-h] --TE TE --cdna CDNA --ncrna NCRNA --sample SAMPLE
                  --paired PAIRED --length LENGTH --out OUT --strand STRAND
-                 [--num_threads NUM_THREADS] [--remove REMOVE] [--index INDEX]
-                 [--mask MASK] [--version]
+                 [--num_threads NUM_THREADS] [--jobs JOBS] [--remove REMOVE]
+                 [--index INDEX] [--mask MASK] [--version]
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -276,6 +276,7 @@ optional arguments:
                         reverse = htseqcount 'reverse'
   --num_threads NUM_THREADS
                         number of threads used by STAR and samtools [2]
+  --jobs JOBS           number of samples to process in parallel [1]
   --remove REMOVE       T (true) or F (false). If this parameter is set to T
                         all the bam files are removed. If it is F they are not
                         removed [T]
@@ -303,11 +304,11 @@ optional arguments:
   --version             show the version number and exit
 ```
 
-All the arguments, except fot ```--num_threads```, ```--remove```, ```--index```, ```--mask``` and ```--multimap``` are required.\
+All the arguments, except fot ```--num_threads```, ```--jobs```, ```--remove```, ```--index```, ```--mask``` and ```--multimap``` are required.\
 We suggest to use as argument of ```--TE``` argument a fasta file containing TE consensus sequences and as arguments of the ```--cdna``` and ```--ncrna``` arguments the transcriptome files containing cdna and ncrna from ensembl (or genecode if working with human or mouse data).\
 The ```--length``` of the read is only needed to build the index of the reference transcriptome - in case of trimmed reads just provide the most frequent read lenght.\
 As ```--strand``` TEspeX expects the same nomenclature as the one used by htseq-count (if you are unsure about the strandedness of your data please take a look at: https://chipster.csc.fi/manual/library-type-summary.html) .\
-By default ```--num_threads``` is set to 2,  ```--remove``` is set to T by default (meaning all the bam files are removed)  and ```--index``` is set to F (meaning TEspeX will take care about index building).
+By default ```--num_threads``` is set to 2, ```--jobs``` is set to 1, ```--remove``` is set to T by default (meaning all the bam files are removed) and ```--index``` is set to F (meaning TEspeX will take care about index building).
 
 
 

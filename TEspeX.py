@@ -33,6 +33,7 @@ try:
   import gzip
   import subprocess
   import math
+  import multiprocessing
   import pysam
   import pandas
   from functools import reduce
@@ -195,6 +196,7 @@ def help():
   parser.add_argument('--out', type=str, help='directory where the output files will be written. This directory is created by the pipeline, specificy a non-yet-existing directory', required=True)
   parser.add_argument('--strand', type=str, help='strandeness of the RNAseq library. no = unstranded/htseqcount \'no\', yes = htseqcount \'yes\', reverse = htseqcount \'reverse\'', required=True)
   parser.add_argument('--num_threads', type=int, default=2, help='number of threads used by STAR and samtools [2]', required=False)
+  parser.add_argument('--jobs', type=int, default=1, help='number of samples to process in parallel [1]', required=False)
   parser.add_argument('--remove', type=str, default='T', help='T (true) or F (false). If this parameter is set to T all the bam files are removed. If it is F they are not removed [T]', required=False)
   parser.add_argument('--index', type=str, default='F', help='If you want TEspeX to build the index for you, leave the default value [recommended]. Otherwise provide FULL path to a directoray containing STAR indexes [not_recommended] [F]', required=False)
   parser.add_argument('--mask', type=str, default='F', help='fasta file containing sequences to be masked. If this file is provided, the sequences contained within it are considered as coding/non-coding transcripts and are added to the --cdna and --ncrna fasta files. This might be of help if the users wish to consider some specific regions as belonging to coding/non-coding transcripts even though they are not reported in --cdna and --ncrna fasta files. (e.g., N kb downstream to the transcript TTS for a better handling of readthrough process or non-genic TE-derived sequences known to be passively transcribed from criptic promoters). [F]', required=False)
@@ -212,6 +214,7 @@ def help():
   dir = os.path.abspath(arg.out)
   strandeness = arg.strand
   num_threads = arg.num_threads
+  jobs = arg.jobs
   rm = arg.remove
   index = arg.index
   if index != "F":
@@ -238,7 +241,7 @@ def help():
   # check index arg
   checkIndex(index)
 
-  return te, cDNA, ncRNA, sample_file, prd, rl, dir, strandeness, num_threads, rm, bin_path, index, mask, multimap
+  return te, cDNA, ncRNA, sample_file, prd, rl, dir, strandeness, num_threads, jobs, rm, bin_path, index, mask, multimap
 
 
 # this function writes the message to the log file in the output directory
@@ -343,201 +346,226 @@ def CountReadsonTE(bamfile):
 # map the reads to the reference. The argument of this function is a file with the full path to the reads
 # if the reads are paired they are written on the same line separated by \t
 #def star_aln(fq_list, bedReference, pair, rm):
-def star_aln(fq_list, strandn, fastaReference, pair, rm, mm, *index_dir):
+def _process_sample(args):
+  line, dir, strandn, fastaReference, pair, rm, mm, num_threads, bin_path, index_dir = args
+  if not line.strip():
+    return None
+  os.chdir(dir)
+  lin = line.split()
+
+  # define the general command (no reads and no zcat)
+  if index_dir:
+    command = bin_path + "STAR-2.6.0c/STAR --outSAMunmapped None --outSAMprimaryFlag AllBestScore --outFilterMismatchNoverLmax 0.04 --outMultimapperOrder Random --outSAMtype BAM Unsorted --outStd BAM_Unsorted --outFilterMultimapNmax " +str(mm)+ " --winAnchorMultimapNmax " +str(mm)+ " --runThreadN " +str(num_threads)+ " --genomeDir " +index_dir
+  else:
+    command = bin_path + "STAR-2.6.0c/STAR --outSAMunmapped None --outSAMprimaryFlag AllBestScore --outFilterMismatchNoverLmax 0.04 --outMultimapperOrder Random --outSAMtype BAM Unsorted --outStd BAM_Unsorted --outFilterMultimapNmax " +str(mm)+ " --winAnchorMultimapNmax " +str(mm)+ " --runThreadN " +str(num_threads)+ " --genomeDir " +os.path.abspath("index")
+
+  writeLog("\n\nI am working with %s" % (line[:-1]))
+  path_filename, file_extension = os.path.splitext(lin[0])	# separate full_path+file and extension
+  filenam = os.path.basename(path_filename)			# extrapolate filename without full_path and extension
+  filename = os.path.splitext(filenam)[0]			# (if the file is fq.gz .fq will remain in filenam)
+  os.mkdir(filename)					# (if the file is fq.gz .fq will remain in filenam)
+  os.chdir(filename)
+
+  # single end
+  if len(lin) == 1:
+    writeLog("single end reads detected")
+    if len(lin) == 1 and pair == "T":
+      writeLog("ERROR: %s contains SE reads but you specify PE reads from command line. Exiting.." % (line.strip()))
+      print("ERROR: %s contains SE reads but you specify PE reads from command line. Exiting.." % (line.strip()))
+      sys.exit(1)
+    if file_extension == ".gz":
+      command_final = command + " --readFilesIn " +lin[0]+ " --readFilesCommand gunzip -c > " +filename+ ".bam"
+    else:
+      command_final = command + " --readFilesIn " +lin[0]+ " > " +filename+ ".bam"
+  # paired end
+  elif len(lin) == 2:
+    writeLog("paired end reads detected")
+    if len(lin) == 2 and pair == "F":
+      writeLog("ERROR: %s contains PE reads but you specify SE reads from command line. Exiting.." % (line.strip()))
+      print("ERROR: %s contains PE reads but you specify SE reads from command line. Exiting.." % (line.strip()))
+      sys.exit(1)
+    if file_extension == ".gz":
+      command_final = command + " --readFilesIn " +lin[0]+ " " +lin[1]+ " --readFilesCommand gunzip -c > "+filename+ ".bam"
+    else:
+      command_final = command + " --readFilesIn " +lin[0]+ " " +lin[1]+ " > " +filename+ ".bam"
+  else:
+    writeLog("ERROR: unrecognized sample line format: %s" % line)
+    sys.exit(1)
+
+  # map reads to reference
+  bash(command_final)
+
+  # extract primary alignments (best score alignments)
+  if pair == "F":
+    if strandn == "no":
+      # exclude (-F) not primary alignment (-F 0x100)
+      prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -F 0x100 -o " +filename+ "_mappedPrim.bam " +filename+ ".bam"
+    elif strandn == "yes":
+      # exclude read reverse strand (-F 0x10) and exclude not primary alignment (-F 0x100)
+      prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -F 0x10 -F 0x100 -o " +filename+ "_mappedPrim.bam " +filename+ ".bam"
+    elif strandn == "reverse":
+      # include read reverse strand (-f 0x10) and exclude not primary alignment (-F 0x100)
+      prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -f 0x10 -F 0x100 -o " +filename+ "_mappedPrim.bam " +filename+ ".bam"
+  elif pair == "T":
+    if strandn == "no":
+      # exclude not primary alignment (-F 0x100)
+      prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -F 0x100 -o " +filename+ "_mappedPrim.bam " +filename+ ".bam"
+    elif strandn == "yes":
+      # include first in pair (-f 0x40), include  mate reverse strand (0x20) and exclude not primary alignment (-F 0x100)
+      prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -f 0x40 -f 0x20 -F 0x100 -o " +filename+ "_mappedPrim_1st.bam " +filename+ ".bam"
+      # include second in pair (-f 0x80), include read reverse strand (0x10) and exclude not primary alignment (-F 0x100)
+      prim_cmd1 = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -f 0x80 -f 0x10 -F 0x100 -o " +filename+ "_mappedPrim_2nd.bam " +filename+ ".bam"
+    elif strandn == "reverse":
+      # include first in pair (-f 0x40), include read reverse strand (0x10) and exclude not primary alignment (-F 0x100)
+      prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -f 0x40 -f 0x10 -F 0x100 -o " +filename+ "_mappedPrim_1st.bam " +filename+ ".bam"
+      # include second in pair (-f 0x80), include mate reverse strand (0x20) and exclude not primary alignment (-F 0x100)
+      prim_cmd1 = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -f 0x80 -f 0x20 -F 0x100 -o " +filename+ "_mappedPrim_2nd.bam " +filename+ ".bam"
+
+  bash(prim_cmd)
+  # if existing launch also prim_cmd1
+  if pair == "T":
+    if strandn == "yes" or strandn == "reverse":
+      bash(prim_cmd1)
+      # merge the two bams
+      mergin_cmd = bin_path + "samtools-1.3.1/bin/samtools merge -@ " +str(num_threads)+ " " +filename+"_mappedPrim.bam " +filename+ "_mappedPrim_1st.bam "+filename+ "_mappedPrim_2nd.bam "
+      bash(mergin_cmd)
+      rm_cmd1 = "rm "+filename+ "_mappedPrim_1st.bam"
+      rm_cmd2 = "rm "+filename+ "_mappedPrim_2nd.bam"
+      bash(rm_cmd1)
+      bash(rm_cmd2)
+
+  # create list containing name of the reads mapping with best score alignmets only on TEs. These reads are mapping specifically on TEs
+  writeLog("selecting reads mapping specifically on TEs")
+  TE = []
+  mrna = []
+  bamfile = pysam.AlignmentFile(filename+"_mappedPrim.bam", "rb")
+  for aln in bamfile.fetch(until_eof=True):
+    if "_transc" in aln.reference_name:
+      mrna.append(aln.query_name)
+    elif "_transp" in aln.reference_name:
+      TE.append(aln.query_name)
+  bamfile.close()
+  final = list( set(TE) - set(mrna) ) 			# these reads map with best score only on TEs and not on transcripts
+  not_specific = list( set(TE) - set(final) )		# these reads map with best score on both TEs and transcripts
+
+  # write the 2 lists in 2 output files
+  with open("specificTE.txt", 'w') as out1:
+    for i in range(0, len(final)):
+      out1.write("%s\n" % (final[i]))
+  with open("not-specificTE.txt", 'w') as out2:
+    for j in range(0, len(not_specific)):
+      out2.write("%s\n" % (not_specific[j]))
+
+  # usem picard to extract alignmets corresponing to reads mapping specifically on TEs
+  if os.stat("specificTE.txt").st_size != 0:		# if specific read file not empty
+    picard = "java -jar " + bin_path + "picard/picard.jar FilterSamReads I="+filename+"_mappedPrim.bam O="+filename+"_specificTE.bam FILTER=includeReadList RLF=specificTE.txt"
+    bash(picard)
+  else:							# if file empty, create a bam containig only the header
+    header_bam = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -H " +filename+ "_mappedPrim.bam -b -o " +filename+"_specificTE.bam"
+    bash(header_bam)
+
+  # count the reads mapping specifically on TEs
+  writeLog("counting TE expression levels considering TE-specific reads containded in " + filename + "_specificTE.bam")
+  def counts(bam,fa):
+    name = filename
+    bam_chr = []
+    bamfile = pysam.AlignmentFile(bam, "rb")
+    for aln in bamfile.fetch(until_eof=True):
+      bam_chr.append(aln.reference_name)
+    bamfile.close()
+
+    fa_chr = []
+    with open(fa) as fa_f:
+      for line in fa_f:
+        if line.startswith(">"):
+          if "_transp" in line:
+            fa_chr.append((line.split()[0]).split(">")[1])
+
+    with open(name+"_counts",'w') as output:
+      output.write("TE\t%s\n" % (name))
+      for chr in fa_chr:
+        # count how many time each TE occurrs in the bam file - this is the number of reads that are specifically mapped on each TE
+        count_raw = bam_chr.count(chr)
+        # if the reads are pair, the pairs rather than the reads have to be counted --> divide by 2
+        # single pair should be discarded by STAR so shouldn't be here. At least this can happen in situation when reads have been trimmed
+        # doing this the mapping given by a complete read pair is counted 1 whereas the mapping of a singleton is counted .5
+        if pair == "T":
+          count_raw = round( count_raw / 2 )
+
+        output.write("%s\t%s\n" % (chr, count_raw))
+  counts(filename+"_specificTE.bam", fastaReference)
+
+  output_name = os.path.abspath(".")+"/"+filename+ "_counts"
+
+  # create a file with statistics
+  writeLog("calculating the mapping statistics...")
+  # total reads
+  def starFinalHandling(star_final):
+    tot_map = 0
+    mapped = 0
+    with open(star_final) as s_stat:
+      for line in s_stat:
+        if "Number of input reads" in line:
+          numb = line.split("\t")[1]
+          tot_map = str(numb[:-1])
+        elif "Uniquely mapped reads number" in line:
+          numb = line.split("\t")[1]
+          mapped = str(int(mapped) + int(numb))
+        elif "Number of reads mapped to multiple loci" in line:
+          numb = line.split("\t")[1]
+          mapped = str(int(mapped) + int(numb))
+    return tot_map, mapped
+  tot, map = starFinalHandling("Log.final.out")
+
+  # reads mapped on TEs
+  mapTEtot = CountReadsonTE(filename+".bam")
+  # reads mapped on TEs with best aln score
+  mapTE = len(final) + len(not_specific)
+  # reads specifically mapped against TE
+  specific = len(final)
+  # reads not specifically mapped against TE
+  not_spec = len(not_specific)
+  # write into output list
+  riga_stat = str(filename)+"\t"+str(tot)+"\t"+str(map)+"\t"+str(mapTEtot)+"\t"+str(mapTE)+"\t"+str(specific)+"\t"+str(not_spec)
+
+  # remove the bam files
+  if rm == 'T':
+    os.remove(filename+".bam")
+    os.remove(filename+ "_mappedPrim.bam")
+    os.remove(filename+"_specificTE.bam")
+
+  return output_name, riga_stat
+
+def star_aln(fq_list, strandn, fastaReference, pair, rm, mm, jobs, *index_dir):
   output_names = []				# this is the list that will contain the names of the bedtools coverage output files
   statOut = []					# this is the list that will contain mapping statistics
   statOut.append("SRR\ttot\tmapped\tmapped-TE\tTE-best\tspecificTE\tnot_specificTE")
-
-  # define the general command (no reads and no zcat)
-  # if  optional arg index_dir is passed it means that indexes have aady been generated and are in index_dir directory
-  # otherwise each directory has its own index
   if index_dir:
     index = index_dir[0]
-    command = bin_path + "STAR-2.6.0c/STAR --outSAMunmapped None --outSAMprimaryFlag AllBestScore --outFilterMismatchNoverLmax 0.04 --outMultimapperOrder Random --outSAMtype BAM Unsorted --outStd BAM_Unsorted --outFilterMultimapNmax " +str(mm)+ " --winAnchorMultimapNmax " +str(mm)+ " --runThreadN " +str(num_threads)+ " --genomeDir " +index
   else:
-    command = bin_path + "STAR-2.6.0c/STAR --outSAMunmapped None --outSAMprimaryFlag AllBestScore --outFilterMismatchNoverLmax 0.04 --outMultimapperOrder Random --outSAMtype BAM Unsorted --outStd BAM_Unsorted --outFilterMultimapNmax " +str(mm)+ " --winAnchorMultimapNmax " +str(mm)+ " --runThreadN " +str(num_threads)+ " --genomeDir " +os.path.abspath("index")
-  # for every line of the file launch the analysis
+    index = None
+
   with open(fq_list) as reads:
-    for line in reads:
-      writeLog("\n\nI am working with %s" % (line[:-1]))
-      os.chdir(dir)
-      lin = line.split()
+    lines = [line for line in reads if line.strip()]
 
-      path_filename, file_extension = os.path.splitext(lin[0])	# separate full_path+file and extension
-      filenam = os.path.basename(path_filename)			# extrapolate filename without full_path and extension
-      filename = os.path.splitext(filenam)[0]			# (if the file is fq.gz .fq will remain in filenam)
-      os.mkdir(filename)					# (if the file is fq.gz .fq will remain in filenam)
-      os.chdir(filename)
+  args_list = []
+  for line in lines:
+    args_list.append((line, dir, strandn, fastaReference, pair, rm, mm, num_threads, bin_path, index))
 
-      # single end
-      if len(lin) == 1:
-        writeLog("single end reads detected")
-        if len(lin) == 1 and pair == "T":
-          writeLog("ERROR: %s file contains SE reads but you specify PE reads from command line. Exiting.." % (fq_list))
-          print("ERROR: %s file contains SE reads but you specify PE reads from command line. Exiting.." % (fq_list))
-          sys.exit(1)
-        if file_extension == ".gz":
-          gzipped = True
-          command_final = command + " --readFilesIn " +lin[0]+ " --readFilesCommand gunzip -c > " +filename+ ".bam"
-        else:
-          gzipped = False
-          command_final = command + " --readFilesIn " +lin[0]+ " > " +filename+ ".bam"
-      # paired end
-      elif len(lin) == 2:
-        writeLog("paired end reads detected")
-        if len(lin) == 2 and pair == "F":
-          writeLog("ERROR: %s file contains PE reads but you specify SE reads from command line. Exiting.." % (fq_list))
-          print("ERROR: %s file contains PE reads but you specify SE reads from command line. Exiting.." % (fq_list))
-          sys.exit(1)
-        if file_extension == ".gz":
-          gzipped = True
-          command_final = command + " --readFilesIn " +lin[0]+ " " +lin[1]+ " --readFilesCommand gunzip -c > "+filename+ ".bam"
-        else:
-          gzipped = False
-          command_final = command + " --readFilesIn " +lin[0]+ " " +lin[1]+ " > " +filename+ ".bam"
-    # map reads to reference
-      bash(command_final)
+  if jobs > 1:
+    with multiprocessing.Pool(processes=jobs) as pool:
+      results = pool.map(_process_sample, args_list)
+  else:
+    results = []
+    for args in args_list:
+      results.append(_process_sample(args))
 
-    # extract primary alignments (best score alignments)
-      if pair == "F":
-        if strandn == "no":
-          # exclude (-F) not primary alignment (-F 0x100)
-          prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -F 0x100 -o " +filename+ "_mappedPrim.bam " +filename+ ".bam"
-        elif strandn == "yes":
-          # exclude read reverse strand (-F 0x10) and exclude not primary alignment (-F 0x100)
-          prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -F 0x10 -F 0x100 -o " +filename+ "_mappedPrim.bam " +filename+ ".bam"
-        elif strandn == "reverse":
-          # include read reverse strand (-f 0x10) and exclude not primary alignment (-F 0x100)
-          prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -f 0x10 -F 0x100 -o " +filename+ "_mappedPrim.bam " +filename+ ".bam"
-      elif pair == "T":
-        if strandn == "no":
-          # exclude not primary alignment (-F 0x100)
-          prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -F 0x100 -o " +filename+ "_mappedPrim.bam " +filename+ ".bam"
-        elif strandn == "yes":
-          # include first in pair (-f 0x40), include  mate reverse strand (0x20) and exclude not primary alignment (-F 0x100)
-          prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -f 0x40 -f 0x20 -F 0x100 -o " +filename+ "_mappedPrim_1st.bam " +filename+ ".bam"
-          # include second in pair (-f 0x80), include read reverse strand (0x10) and exclude not primary alignment (-F 0x100)
-          prim_cmd1 = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -f 0x80 -f 0x10 -F 0x100 -o " +filename+ "_mappedPrim_2nd.bam " +filename+ ".bam"
-        elif strandn == "reverse":
-          # include first in pair (-f 0x40), include read reverse strand (0x10) and exclude not primary alignment (-F 0x100)
-          prim_cmd = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -f 0x40 -f 0x10 -F 0x100 -o " +filename+ "_mappedPrim_1st.bam " +filename+ ".bam"
-          # include second in pair (-f 0x80), include mate reverse strand (0x20) and exclude not primary alignment (-F 0x100)
-          prim_cmd1 = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -b -f 0x80 -f 0x20 -F 0x100 -o " +filename+ "_mappedPrim_2nd.bam " +filename+ ".bam"
-
-      bash(prim_cmd)
-      # if existing launch also prim_cmd1
-      if pair == "T":
-        if strandn == "yes" or strandn == "reverse":
-          bash(prim_cmd1)
-          # merge the two bams
-          mergin_cmd = bin_path + "samtools-1.3.1/bin/samtools merge -@ " +str(num_threads)+ " " +filename+"_mappedPrim.bam " +filename+ "_mappedPrim_1st.bam "+filename+ "_mappedPrim_2nd.bam "
-          bash(mergin_cmd)
-          rm_cmd1 = "rm "+filename+ "_mappedPrim_1st.bam"
-          rm_cmd2 = "rm "+filename+ "_mappedPrim_2nd.bam"
-          bash(rm_cmd1)
-          bash(rm_cmd2)
-      
-
-    # create list containing name of the reads mapping with best score alignmets only on TEs. These reads are mapping specifically on TEs
-      writeLog("selecting reads mapping specifically on TEs")
-      TE = []
-      mrna = []
-      bamfile = pysam.AlignmentFile(filename+"_mappedPrim.bam", "rb")
-      for aln in bamfile.fetch(until_eof=True):
-        if "_transc" in aln.reference_name:
-          mrna.append(aln.query_name)
-        elif "_transp" in aln.reference_name:
-          TE.append(aln.query_name)
-      bamfile.close()
-      final = list( set(TE) - set(mrna) ) 			# these reads map with best score only on TEs and not on transcripts
-      not_specific = list( set(TE) - set(final) )		# these reads map with best score on both TEs and transcripts
-
-      # write the 2 lists in 2 output files
-      with open("specificTE.txt", 'w') as out1:
-        for i in range(0, len(final)):
-          out1.write("%s\n" % (final[i]))
-      with open("not-specificTE.txt", 'w') as out2:
-        for j in range(0, len(not_specific)):
-          out2.write("%s\n" % (not_specific[j]))
-
-    # usem picard to extract alignmets corresponing to reads mapping specifically on TEs
-      if os.stat("specificTE.txt").st_size != 0:		# if specific read file not empty
-        picard = "java -jar " + bin_path + "picard/picard.jar FilterSamReads I="+filename+"_mappedPrim.bam O="+filename+"_specificTE.bam FILTER=includeReadList RLF=specificTE.txt"
-        bash(picard)
-      else:							# if file empty, create a bam containig only the header
-        header_bam = bin_path + "samtools-1.3.1/bin/samtools view -@ " +str(num_threads)+ " -H " +filename+ "_mappedPrim.bam -b -o " +filename+"_specificTE.bam"
-        bash(header_bam)
-
-    # count the reads mapping specifically on TEs
-      writeLog("counting TE expression levels considering TE-specific reads containded in " + filename + "_specificTE.bam")
-      def counts(bam,fa):
-        name = filename
-        bam_chr = []
-        bamfile = pysam.AlignmentFile(bam, "rb")
-        for aln in bamfile.fetch(until_eof=True):
-          bam_chr.append(aln.reference_name)
-        bamfile.close()
-
-        fa_chr = []
-        with open(fa) as fa_f:
-          for line in fa_f:
-            if line.startswith(">"):
-              if "_transp" in line:
-                fa_chr.append((line.split()[0]).split(">")[1])
-
-        with open(name+"_counts",'w') as output:
-          output.write("TE\t%s\n" % (name))
-          for chr in fa_chr:
-            # count how many time each TE occurrs in the bam file - this is the number of reads that are specifically mapped on each TE
-            count_raw = bam_chr.count(chr)
-            # if the reads are pair, the pairs rather than the reads have to be counted --> divide by 2
-            # single pair should be discarded by STAR so shouldn't be here. At least this can happen in situation when reads have been trimmed
-            # doing this the mapping given by a complete read pair is counted 1 whereas the mapping of a singleton is counted .5
-            if pair == "T":
-              count_raw = round( count_raw / 2 )
-
-            output.write("%s\t%s\n" % (chr, count_raw))
-      counts(filename+"_specificTE.bam", fastaReference)
-#      # append the name of the bedtools coverage output in the list
-      output_names.append(os.path.abspath(".")+"/"+filename+ "_counts")
-
-    # create a file with statistics
-      writeLog("calculating the mapping statistics...")
-      # total reads
-      def starFinalHandling(star_final):
-        tot_map = 0
-        mapped = 0
-        with open(star_final) as s_stat:
-          for line in s_stat:
-            if "Number of input reads" in line:
-              numb = line.split("\t")[1]
-              tot_map = str(numb[:-1])
-            elif "Uniquely mapped reads number" in line:
-              numb = line.split("\t")[1]
-              mapped = str(int(mapped) + int(numb))
-            elif "Number of reads mapped to multiple loci" in line:
-              numb = line.split("\t")[1]
-              mapped = str(int(mapped) + int(numb))
-        return tot_map, mapped
-      tot, map = starFinalHandling("Log.final.out")
-
-      # reads mapped on TEs
-      mapTEtot = CountReadsonTE(filename+".bam")
-      # reads mapped on TEs with best aln score
-      mapTE = len(final) + len(not_specific)
-      # reads specifically mapped against TE
-      specific = len(final)
-      # reads not specifically mapped against TE
-      not_spec = len(not_specific)
-      # write into output list
-      riga_stat = str(filename)+"\t"+str(tot)+"\t"+str(map)+"\t"+str(mapTEtot)+"\t"+str(mapTE)+"\t"+str(specific)+"\t"+str(not_spec)
-      statOut.append(riga_stat)
-
-      # remove the bam files
-      if rm == 'T':
-        os.remove(filename+".bam")
-        os.remove(filename+ "_mappedPrim.bam")
-        os.remove(filename+"_specificTE.bam")
+  for result in results:
+    if not result:
+      continue
+    output_name, riga_stat = result
+    output_names.append(output_name)
+    statOut.append(riga_stat)
 
   return output_names, statOut
 
@@ -578,9 +606,9 @@ def checkReference(file_name):
 
 # main
 def main():
-  TE, cdna, ncrna, sample, paired, read_length, dir, strand, num_threads, remove, bin_path, indici, maskfile, multimappers = help()
+  TE, cdna, ncrna, sample, paired, read_length, dir, strand, num_threads, jobs, remove, bin_path, indici, maskfile, multimappers = help()
   os.chdir(dir)
-  writeLog("\nuser command line arguments:\nTE file = %s\ncdna file = %s\nncrna file = %s\nsampleFile file = %s\npaired = %s\nreadLength = %s\noutDir = %s\nstrand = %s\nnum_threads = %s \nremove = %s\nindex = %s\nmask file = %s\nmultimappers = %s\n" % (TE, cdna, ncrna, sample, paired, read_length, dir, strand, num_threads, remove, indici, maskfile,multimappers))
+  writeLog("\nuser command line arguments:\nTE file = %s\ncdna file = %s\nncrna file = %s\nsampleFile file = %s\npaired = %s\nreadLength = %s\noutDir = %s\nstrand = %s\nnum_threads = %s\njobs = %s\nremove = %s\nindex = %s\nmask file = %s\nmultimappers = %s\n" % (TE, cdna, ncrna, sample, paired, read_length, dir, strand, num_threads, jobs, remove, indici, maskfile,multimappers))
 
   # create reference transcriptome and STAR index
   if indici == 'F':
@@ -600,7 +628,7 @@ def main():
     # STAR index of the reference transcriptome
     star_ind(reference, read_length)
     # Map reads to reference and count TE-specific reads
-    outfile, statfile = star_aln(sample, strand, reference, paired, remove, multimappers)
+    outfile, statfile = star_aln(sample, strand, reference, paired, remove, multimappers, jobs)
   else:
     # if indici is not set to F, it means that a pre-existing index is provided. Threfore, there is no need to generate the reference and index
     writeLog("reading index in %s" % (indici))
@@ -610,7 +638,7 @@ def main():
     # check the reference file does not contain any duplicataed sequences
     checkReference(reference)
     # Map reads to reference and count TE-specific reads
-    outfile, statfile = star_aln(sample, strand, reference, paired, remove, multimappers, indici)
+    outfile, statfile = star_aln(sample, strand, reference, paired, remove, multimappers, jobs, indici)
   createOut(outfile, statfile)
 
 
